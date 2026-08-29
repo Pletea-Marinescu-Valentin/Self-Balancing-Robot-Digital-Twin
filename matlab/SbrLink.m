@@ -1,7 +1,9 @@
 classdef SbrLink < handle
-%SBRLINK  Serial link to the motor node. Protocol: docs/protocol.md
+%SBRLINK  Link to the motor node, over USB serial or WiFi TCP.
+%   Protocol: docs/protocol.md
 %
-%   lnk = SbrLink("COM4");
+%   lnk = SbrLink("COM4");            % USB
+%   lnk = SbrLink("192.168.4.1");     % the robot's own access point
 %   lnk.arm(true);  lnk.mode(1);
 %   d = lnk.readLatest();
 %   lnk.torque(0.5, 0.5);
@@ -19,6 +21,7 @@ classdef SbrLink < handle
 
     properties (SetAccess = private)
         port
+        isTcp     (1,1) logical = false
         nDropped  (1,1) double = 0
         nBadCrc   (1,1) double = 0
     end
@@ -28,16 +31,30 @@ classdef SbrLink < handle
     end
 
     methods
-        function obj = SbrLink(portName, baud, bootWait)
+        function obj = SbrLink(target, arg2, bootWait)
+        %SBRLINK  Open the link. Serial or WiFi, chosen by what you pass.
+        %   SbrLink("COM4")            serial, 115200
+        %   SbrLink("192.168.4.1")     TCP to the robot's own access point
+        %   arg2 is the baud rate for a COM port, the TCP port for an address.
             arguments
-                portName (1,1) string
-                baud     (1,1) double = 115200
-                bootWait (1,1) double = 6.0
+                target   (1,1) string
+                arg2     (1,1) double = 0
+                bootWait (1,1) double = -1
             end
-            obj.port = serialport(portName, baud, "Timeout", 0.05);
+
+            obj.isTcp = contains(target, ".");
+            if obj.isTcp
+                if arg2 == 0,     arg2 = 3333;     end
+                if bootWait < 0,  bootWait = 0.5;  end
+                obj.port = tcpclient(target, arg2, "Timeout", 0.05);
+            else
+                if arg2 == 0,     arg2 = 115200;   end
+                if bootWait < 0,  bootWait = 6.0;  end
+                obj.port = serialport(target, arg2, "Timeout", 0.05);
+            end
+
             pause(bootWait);
-            flush(obj.port);
-            obj.buf = uint8([]);
+            obj.flushInput();
         end
 
         function delete(obj)
@@ -50,10 +67,17 @@ classdef SbrLink < handle
 
         function d = readLatest(obj)
         %READLATEST  Newest valid frame, or [] if nothing new arrived.
+        %   A dropped TCP connection must read as "no frame", not as an
+        %   exception: over WiFi that would abort a tuning session on one
+        %   bad moment, while the robot is still balancing perfectly well.
             d = [];
-            n = obj.port.NumBytesAvailable;
-            if n > 0
-                obj.buf = [obj.buf; uint8(read(obj.port, n, "uint8")')];
+            try
+                n = obj.port.NumBytesAvailable;
+                if n > 0
+                    obj.buf = [obj.buf; uint8(read(obj.port, n, "uint8")')];
+                end
+            catch
+                return
             end
             if numel(obj.buf) < obj.PKT_LEN
                 return
@@ -82,7 +106,12 @@ classdef SbrLink < handle
         end
 
         function flushInput(obj)
-            flush(obj.port);
+            try
+                flush(obj.port);
+            catch
+                n = obj.port.NumBytesAvailable;
+                if n > 0, read(obj.port, n, "uint8"); end
+            end
             obj.buf = uint8([]);
         end
 
@@ -182,7 +211,10 @@ classdef SbrLink < handle
             pkt(3) = uint8(type);
             pkt(4:15) = typecast(single([p1 p2 p3]), "uint8");
             pkt(16) = SbrLink.xorSum(pkt(3:15));
-            write(obj.port, pkt, "uint8");
+            try
+                write(obj.port, pkt, "uint8");
+            catch
+            end
         end
     end
 

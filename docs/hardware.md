@@ -93,6 +93,54 @@ directly and is never differentiated.
 `IMU_BAUD` is a direct wire between two ESP32s with no USB bridge in the
 path, which is why it stays high while the USB link does not.
 
+## Wireless link (WiFi access point)
+
+`PC_LINK_WIFI 1` in `config.h` moves the MATLAB link off USB. The motor node
+brings up its own access point and serves the same binary protocol over TCP,
+so nothing about the frame format changes.
+
+| Define | Value |
+|---|---|
+| `WIFI_AP_SSID` | `sbr-robot` |
+| `WIFI_AP_PASS` | `balancebot` |
+| `WIFI_TCP_PORT` | 3333 |
+
+The node's address is `192.168.4.1`, the ESP32 softAP default. Join the
+network from the laptop, then pass the address instead of a COM port:
+
+```matlab
+lnk = SbrLink("192.168.4.1");
+```
+
+`SbrLink` picks the transport from the string: anything containing a dot is
+treated as an address, everything else as a serial port.
+
+This is only safe because the PID runs on the ESP32. Link latency is not in
+the control loop, so a stalled packet costs points on a plot, not the robot.
+Do not move a MATLAB-side control loop onto this.
+
+Four things this arrangement needs, all of them already set:
+
+- **`WDT_TIMEOUT_MS` becomes 1000 ms** when `PC_LINK_WIFI` is set. The 250 ms
+  serial value is tighter than a WiFi retry burst, and would cut the motors
+  for no reason. It is still a valid dead-man switch.
+- **`setNoDelay(true)`** on the client and the server. Nagle's algorithm
+  batches small writes, and every frame here is a small write.
+- **`WiFi.setSleep(false)`.** ESP32 power saving parks the radio between
+  beacons and adds 100 ms or more of latency.
+- **Telemetry is dropped, never blocked.** `pcWrite` checks
+  `availableForWrite` first and skips the frame if the socket is full. A
+  blocking write inside the FOC loop would stall commutation.
+
+Watch `foc_hz` after switching. The radio stack shares the CPU, and the
+number to compare against is what the same board reported over USB.
+
+Only one client at a time; a second connection is accepted and immediately
+closed so a stale session cannot wedge the port.
+
+Flashing still needs the cable. `ArduinoOTA` would remove that too, and the
+access point is already up for it.
+
 ## Health numbers
 
 Read these from `s00_motor_check.m`:

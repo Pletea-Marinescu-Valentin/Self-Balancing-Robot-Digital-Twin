@@ -9,6 +9,12 @@
 #include "config.h"
 #include "protocol.h"
 
+#if PC_LINK_WIFI
+#include <WiFi.h>
+static WiFiServer pcServer(WIFI_TCP_PORT);
+static WiFiClient pcClient;
+#endif
+
 BLDCMotor         motor0(POLE_PAIRS);
 BLDCMotor         motor1(POLE_PAIRS);
 BLDCDriver3PWM    drv0(M0_A, M0_B, M0_C, M0_EN);
@@ -160,9 +166,46 @@ static void applyCommand(const CmdPkt &c) {
   g_last_cmd_ms = millis();
 }
 
+static Stream *pcLink() {
+#if PC_LINK_WIFI
+  return pcClient.connected() ? (Stream *)&pcClient : nullptr;
+#else
+  return (Stream *)&Serial;
+#endif
+}
+
+static void pcWrite(const uint8_t *b, size_t n) {
+#if PC_LINK_WIFI
+  if (!pcClient.connected()) return;
+  if ((size_t)pcClient.availableForWrite() < n) return;
+  pcClient.write(b, n);
+#else
+  Serial.write(b, n);
+#endif
+}
+
+static void servicePcTransport() {
+#if PC_LINK_WIFI
+  if (pcClient.connected()) {
+    if (!pcServer.hasClient()) return;
+    pcServer.accept().stop();
+    return;
+  }
+  if (pcClient) pcClient.stop();
+  if (pcServer.hasClient()) {
+    pcClient = pcServer.accept();
+    pcClient.setNoDelay(true);
+    rxIdx = 0;
+  }
+#endif
+}
+
 static void servicePcLink() {
-  while (Serial.available()) {
-    uint8_t b = Serial.read();
+  Stream *pc = pcLink();
+  if (pc == nullptr) { rxIdx = 0; return; }
+
+  while (pc->available()) {
+    uint8_t b = pc->read();
 
     if (rxIdx == 0) { if (b == SBR_PC_SYNC0) rxBuf[rxIdx++] = b; continue; }
     if (rxIdx == 1) {
@@ -204,13 +247,25 @@ static void sendTelemetry(float imu_age_ms) {
              (g_imu_link   ? 0x20 : 0) |
              ((uint8_t)g_mode << 6);
   t.crc = sbrXor((uint8_t *)&t + 2, sizeof(TelemPkt) - 3);
-  Serial.write((uint8_t *)&t, sizeof(TelemPkt));
+  pcWrite((uint8_t *)&t, sizeof(TelemPkt));
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
   ImuLink.begin(IMU_BAUD, SERIAL_8N1, IMU_RX, IMU_TX);
   delay(300);
+
+#if PC_LINK_WIFI
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, WIFI_AP_CHANNEL);
+  WiFi.setSleep(false);
+  pcServer.begin();
+  pcServer.setNoDelay(true);
+  Serial.print(F("AP \"" WIFI_AP_SSID "\" up, connect to "));
+  Serial.print(WiFi.softAPIP());
+  Serial.print(F(" port "));
+  Serial.println(WIFI_TCP_PORT);
+#endif
 
   Wire.begin(I2C0_SDA, I2C0_SCL, I2C_ENC_HZ);
   Wire1.begin(I2C1_SDA, I2C1_SCL, I2C_ENC_HZ);
@@ -273,6 +328,7 @@ void loop() {
   foc_count++;
 
   serviceImuLink();
+  servicePcTransport();
   servicePcLink();
 
   const uint32_t now_us = micros();

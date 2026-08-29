@@ -33,7 +33,7 @@
 
 #define MOTOR_KV         0.0f
 
-#define V_SUPPLY         12.0f
+#define V_SUPPLY         10.0f
 #define V_LIMIT           8.0f
 #define CURRENT_LIMIT     0.8f
 
@@ -49,7 +49,17 @@
 
 #define TELEM_DIV        4
 
+#define PC_LINK_WIFI     1
+#define WIFI_AP_SSID     "sbr-robot"
+#define WIFI_AP_PASS     "balancebot"
+#define WIFI_AP_CHANNEL  6
+#define WIFI_TCP_PORT    3333
+
+#if PC_LINK_WIFI
+#define WDT_TIMEOUT_MS   1000
+#else
 #define WDT_TIMEOUT_MS   250
+#endif
 #define TILT_LIMIT_RAD   0.60f
 #define U_LIMIT_DEFAULT   3.0f
 

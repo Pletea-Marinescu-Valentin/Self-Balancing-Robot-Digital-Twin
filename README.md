@@ -30,6 +30,29 @@ docs/                   protocol and hardware reference
 logs/                   .mat files written by the scripts
 ```
 
+## Connecting
+
+Over USB:
+
+```matlab
+lnk = SbrLink("COM4");
+```
+
+Over WiFi — the motor node runs its own access point (`sbr-robot` /
+`balancebot`). Join it from the laptop, then:
+
+```matlab
+lnk = SbrLink("192.168.4.1");
+```
+
+Each script has a `PORT` line at the top; put either form there. Wireless
+works here only because the PID runs on the ESP32: link latency is outside
+the control loop, so a stalled packet costs points on a plot, not the robot.
+Set `PC_LINK_WIFI` to 0 in `config.h` to go back to USB. Details and the
+tuning that makes it reliable are in `docs/hardware.md`.
+
+Flashing still needs the cable.
+
 ## Bring-up order
 
 Flash both nodes once, then run the scripts in order. Each one has to pass

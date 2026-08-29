@@ -5,7 +5,7 @@
 
 clear; clc; close all;
 
-PORT      = "COM4";
+PORT      = "COM4";     % or "192.168.4.1" for WiFi
 DURATION  = 300;
 U_MAX     = 3.0;
 TILT_MAX  = deg2rad(30);
