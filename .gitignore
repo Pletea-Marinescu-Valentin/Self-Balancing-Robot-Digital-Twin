@@ -1,0 +1,4 @@
+logs/*.mat
+*.asv
+*.slxc
+slprj/
