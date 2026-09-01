@@ -24,6 +24,12 @@ static_assert(sizeof(ImuPkt) == 44, "ImuPkt must be 44 bytes - check packing");
 #define SBR_PC_SYNC0   0xA5
 #define SBR_PC_SYNC1   0x5A
 
+// ref / vel_fwd / pos_fwd are the outer (wheel) loop's own state. They are on
+// the wire because that loop cannot be tuned from the angle trace alone: the
+// balance angle can look perfect while the robot rolls off the table.
+//   ref      commanded lean [rad], the outer loop's output
+//   vel_fwd  filtered forward wheel speed [rad/s], the outer loop's input
+//   pos_fwd  forward wheel travel [rad] since the robot last caught itself
 struct __attribute__((packed)) TelemPkt {
   uint8_t  s0, s1;
   uint32_t t_us;
@@ -34,10 +40,11 @@ struct __attribute__((packed)) TelemPkt {
   float    pos0, pos1, vel0, vel1;
   float    u0, u1;
   float    foc_hz, imu_hz, imu_age_ms;
+  float    ref, vel_fwd, pos_fwd;
   uint8_t  status;
   uint8_t  crc;
 };
-static_assert(sizeof(TelemPkt) == 88, "TelemPkt must be 88 bytes - check packing");
+static_assert(sizeof(TelemPkt) == 100, "TelemPkt must be 100 bytes - check packing");
 
 struct __attribute__((packed)) CmdPkt {
   uint8_t s0, s1, type;
@@ -54,7 +61,10 @@ enum SbrCmd : uint8_t {
   SBR_LIMITS   = 0x05,
   SBR_ARM      = 0x06,
   SBR_TRIM     = 0x07,
-  SBR_IMUAXIS  = 0x08
+  SBR_IMUAXIS  = 0x08,
+  SBR_OUTER    = 0x09,
+  SBR_YAW      = 0x0A,
+  SBR_FRICTION = 0x0B
 };
 
 static inline uint8_t sbrXor(const uint8_t *p, size_t n) {

@@ -11,6 +11,7 @@
 
 #if PC_LINK_WIFI
 #include <WiFi.h>
+#include <lwip/sockets.h>
 static WiFiServer pcServer(WIFI_TCP_PORT);
 static WiFiClient pcClient;
 #endif
@@ -44,6 +45,21 @@ static float g_ref_angle = 0.0f;
 static float g_trim = 0.0f;
 static float g_u_limit    = U_LIMIT_DEFAULT;
 static float g_tilt_limit = TILT_LIMIT_RAD;
+
+// --- outer loop: wheel speed and travel -> a lean for the balance loop -----
+static float g_kv        = KV_DEFAULT;
+static float g_kvi       = KVI_DEFAULT;
+static float g_ref_limit = REF_LIMIT_DEFAULT;
+static float g_kyaw_p    = KYAW_P_DEFAULT;
+static float g_kyaw_d    = KYAW_D_DEFAULT;
+static float g_u_fric    = U_FRIC_DEFAULT;
+static float g_v_eps     = V_FRIC_EPS;
+
+static float g_vel_fwd = 0.0f;   // filtered forward wheel speed [rad/s]
+static float g_pos_fwd = 0.0f;   // forward travel since capture [rad]
+static float g_ref_out = 0.0f;   // outer loop output: commanded lean [rad]
+static float g_x0      = 0.0f;   // travel origin, captured when the motors engage
+static float g_yaw0    = 0.0f;   // heading origin, same moment
 
 static float g_eul[3] = {0, 0, 0};
 static float g_gyr[3] = {0, 0, 0};
@@ -108,6 +124,76 @@ static void serviceImuLink() {
 static uint8_t rxBuf[sizeof(CmdPkt)];
 static uint8_t rxIdx = 0;
 
+// Forward and differential wheel state.
+//
+// Built with the same MOTORn_DIR constants that drive the motors, which is
+// what makes the outer-loop signs positive by construction: a positive u is
+// applied as MOTORn_DIR * u, and initFOC() aligns each encoder so that a
+// positive q-axis voltage produces a positive shaft_velocity. Combine the two
+// wheels through those same constants and +u always means +forward.
+static inline float wheelFwdPos() {
+  return 0.5f * (MOTOR0_DIR * motor0.shaft_angle + MOTOR1_DIR * motor1.shaft_angle);
+}
+static inline float wheelFwdVel() {
+  return 0.5f * (MOTOR0_DIR * motor0.shaft_velocity + MOTOR1_DIR * motor1.shaft_velocity);
+}
+static inline float wheelYawPos() {
+  return 0.5f * (MOTOR0_DIR * motor0.shaft_angle - MOTOR1_DIR * motor1.shaft_angle);
+}
+static inline float wheelYawVel() {
+  return 0.5f * (MOTOR0_DIR * motor0.shaft_velocity - MOTOR1_DIR * motor1.shaft_velocity);
+}
+
+// Coulomb friction feedforward, ramped rather than a step at zero. A bare
+// sign() would chatter every time the wheel crosses standstill, which is
+// exactly where a balancing robot spends its time.
+static inline float fricFF(float v) {
+  if (g_u_fric <= 0.0f) return 0.0f;
+  return g_u_fric * constrain(v / g_v_eps, -1.0f, 1.0f);
+}
+
+// Called on the unsafe -> safe edge, never inside the loop. The travel origin
+// has to be taken at the moment the motors engage: "go back where you were"
+// means where the robot caught itself, not wherever it happened to boot.
+static void resetOuterState() {
+  g_integ   = 0.0f;
+  g_vel_fwd = 0.0f;
+  g_pos_fwd = 0.0f;
+  g_ref_out = 0.0f;
+  g_x0      = wheelFwdPos();
+  g_yaw0    = wheelYawPos();
+}
+
+// The outer loop. Runs at CTRL_HZ / OUTER_DIV; the ratio matters more than the
+// absolute rate, because an outer loop close in bandwidth to the inner one
+// turns the cascade into two controllers arguing.
+static void updateOuterLoop(bool safe) {
+  if (!safe) {
+    g_vel_fwd = 0.0f;
+    g_pos_fwd = 0.0f;
+    g_ref_out = 0.0f;
+    return;
+  }
+
+  const float dt = (float)OUTER_DIV / (float)CTRL_HZ;
+
+  // SimpleFOC already filters shaft_velocity at FOC_VEL_TF, but that is sized
+  // for the FOC loop. This loop works below a couple of hertz and wants a much
+  // quieter signal than commutation does.
+  const float a = 1.0f - expf(-2.0f * PI * VEL_LPF_HZ * dt);
+  g_vel_fwd += a * (wheelFwdVel() - g_vel_fwd);
+  g_pos_fwd  = wheelFwdPos() - g_x0;
+
+  // Travel gets at most half the authority so that damping the speed always
+  // has room left. Without the split, a long drift saturates the lean on
+  // position alone and the loop stops reacting to speed at all.
+  const float half     = 0.5f * g_ref_limit;
+  const float from_vel = constrain(g_kv  * g_vel_fwd, -g_ref_limit, g_ref_limit);
+  const float from_pos = constrain(g_kvi * g_pos_fwd, -half, half);
+
+  g_ref_out = constrain(from_vel + from_pos, -g_ref_limit, g_ref_limit);
+}
+
 static bool decodeSel(float v, uint8_t &idx, float &sgn) {
   const int n = (int)lroundf(fabsf(v));
   if (n < 1 || n > 3) return false;
@@ -129,8 +215,8 @@ static void applyCommand(const CmdPkt &c) {
       const int m = (int)lroundf(c.p1);
       if (m < 0 || m > 2) return;
       g_mode  = (Mode)m;
-      g_integ = 0.0f;
       g_cmd0  = g_cmd1 = 0.0f;
+      resetOuterState();
       break;
     }
     case SBR_SETPOINT:
@@ -145,8 +231,8 @@ static void applyCommand(const CmdPkt &c) {
         g_tilt_fault = false;
         g_wdt_fault  = false;
         g_imu_fault  = false;
-        g_integ      = 0.0f;
         g_armed      = true;
+        resetOuterState();
       } else {
         g_armed = false;
       }
@@ -159,6 +245,21 @@ static void applyCommand(const CmdPkt &c) {
       decodeSel(c.p1, g_ang_idx, g_ang_sign);
       decodeSel(c.p2, g_gyr_idx, g_gyr_sign);
       applyImuSelection();
+      break;
+    case SBR_OUTER:
+      // Gains are signed on purpose. They should not need flipping, but a
+      // mirrored build is cheaper to fix from a slider than from a reflash.
+      g_kv  = c.p1;
+      g_kvi = c.p2;
+      if (c.p3 > 0.0f) g_ref_limit = c.p3;
+      break;
+    case SBR_YAW:
+      g_kyaw_p = c.p1;
+      g_kyaw_d = c.p2;
+      break;
+    case SBR_FRICTION:
+      g_u_fric = (c.p1 > 0.0f) ? c.p1 : 0.0f;
+      if (c.p2 > 0.0f) g_v_eps = c.p2;
       break;
     default:
       return;
@@ -177,7 +278,26 @@ static Stream *pcLink() {
 static void pcWrite(const uint8_t *b, size_t n) {
 #if PC_LINK_WIFI
   if (!pcClient.connected()) return;
-  if ((size_t)pcClient.availableForWrite() < n) return;
+
+  // Do NOT gate this on availableForWrite(). WiFiClient does not override it,
+  // so it returns Print's default of 0 and every frame is silently dropped:
+  // the link connects, MATLAB waits, and not one byte ever arrives.
+  //
+  // The gate still has to exist, though. NetworkClient::write() blocks up to
+  // 10 s on a full send buffer (10 retries x a 1 s select), and this runs
+  // inside the 200 Hz control loop. So ask the socket directly, with a zero
+  // timeout: writable now, or drop this frame and send the next one.
+  const int sock = pcClient.fd();
+  if (sock < 0) return;
+
+  fd_set wset;
+  FD_ZERO(&wset);
+  FD_SET(sock, &wset);
+  struct timeval tv = { 0, 0 };
+  if (select(sock + 1, nullptr, &wset, nullptr, &tv) <= 0) return;
+
+  // write(), not a raw send(): it completes the whole frame. A partial frame
+  // would desync the parser on the far side.
   pcClient.write(b, n);
 #else
   Serial.write(b, n);
@@ -239,6 +359,9 @@ static void sendTelemetry(float imu_age_ms) {
   t.foc_hz = g_align_ok ? g_foc_hz : -1.0f;
   t.imu_hz = g_imu_hz;
   t.imu_age_ms = imu_age_ms;
+  t.ref     = g_ref_out;
+  t.vel_fwd = g_vel_fwd;
+  t.pos_fwd = g_pos_fwd;
   t.status = (g_armed      ? 0x01 : 0) |
              (g_imu_ok     ? 0x02 : 0) |
              (g_tilt_fault ? 0x04 : 0) |
@@ -289,6 +412,7 @@ void setup() {
     m->controller        = MotionControlType::torque;
     m->torque_controller = TorqueControlType::voltage;
     m->voltage_limit     = V_LIMIT;
+    m->LPF_velocity.Tf   = FOC_VEL_TF;
     if (PHASE_RESISTANCE > 0.0f) {
       m->phase_resistance = PHASE_RESISTANCE;
       m->current_limit    = CURRENT_LIMIT;
@@ -360,9 +484,15 @@ void loop() {
 
   static bool prev_safe = false;
   if (safe != prev_safe) {
-    if (safe) { motor0.enable();  motor1.enable();  }
-    else      { motor0.disable(); motor1.disable(); }
+    if (safe) { resetOuterState(); motor0.enable();  motor1.enable();  }
+    else      {                    motor0.disable(); motor1.disable(); }
     prev_safe = safe;
+  }
+
+  static uint8_t outer_div = 0;
+  if (++outer_div >= OUTER_DIV) {
+    outer_div = 0;
+    updateOuterLoop(safe);
   }
 
   if (!safe) {
@@ -370,20 +500,33 @@ void loop() {
     g_integ = 0.0f;
   } else {
     if (g_mode == MODE_DIRECT) {
+      // No outer loop, no friction term: s00_motor_check measures the wheels
+      // through this mode, and anything added here corrupts that measurement.
       g_u0 = constrain(g_cmd0, -g_u_limit, g_u_limit);
       g_u1 = constrain(g_cmd1, -g_u_limit, g_u_limit);
     } else if (g_mode == MODE_PID) {
       const float dt  = 1.0f / CTRL_HZ;
-      const float err = (g_ref_angle + g_trim) - g_angle;
+
+      // g_ref_out is the outer loop's contribution: the lean the robot has to
+      // adopt to stop travelling. g_ref_angle stays the operator's own
+      // setpoint, so the two remain separable when reading a log.
+      const float err = (g_ref_angle + g_ref_out + g_trim) - g_angle;
 
       g_integ += g_ki * err * dt;
       g_integ  = constrain(g_integ, -g_u_limit, g_u_limit);
 
-      float u = g_kp * err + g_integ - g_kd * g_rate;
-      u = constrain(u, -g_u_limit, g_u_limit);
+      const float u = g_kp * err + g_integ - g_kd * g_rate;
 
-      g_u0 = u;
-      g_u1 = u;
+      // Yaw hold, equal and opposite on the two wheels, so it steers without
+      // disturbing the balance command at all.
+      const float u_yaw = -g_kyaw_p * (wheelYawPos() - g_yaw0)
+                          -g_kyaw_d *  wheelYawVel();
+
+      g_u0 = u + u_yaw + fricFF(MOTOR0_DIR * motor0.shaft_velocity);
+      g_u1 = u - u_yaw + fricFF(MOTOR1_DIR * motor1.shaft_velocity);
+
+      g_u0 = constrain(g_u0, -g_u_limit, g_u_limit);
+      g_u1 = constrain(g_u1, -g_u_limit, g_u_limit);
     } else {
       g_u0 = g_u1 = 0.0f;
     }

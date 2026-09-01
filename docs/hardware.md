@@ -41,7 +41,7 @@ visible symptom is usually the IMU dying, several boards away.
 |---|---|---|
 | `POLE_PAIRS` | 7 | magnets / 2 |
 | `PHASE_RESISTANCE` | 0.0 | see below |
-| `V_SUPPLY` | 12.0 | actual supply voltage |
+| `V_SUPPLY` | 10.0 | must equal the **measured** rail; see the note below |
 | `V_LIMIT` | 8.0 | driver clamp |
 | `MOTOR0_DIR` / `MOTOR1_DIR` | +1 / −1 | the motors face opposite ways |
 
@@ -51,6 +51,11 @@ zero and SimpleFOC computes `Uq = I·R`, so commands become **amps** — an
 approximate torque interface. Measure between two phases with a multimeter
 and halve the result. Switching later rescales every PID gain, so retune when
 you do.
+
+**`V_SUPPLY` has to match reality.** `BLDCDriver3PWM` computes duty as
+`Ua / voltage_power_supply`, so if the define disagrees with the rail the
+motor sees, every command is scaled by the ratio and every PID gain is
+scaled with it. Measure the rail under load and put that number here.
 
 **Torque mode is correct for balancing, and the wheel will feel loose.** A
 position-controlled motor holds its shaft stiffly; a balancing robot needs
@@ -93,6 +98,58 @@ directly and is never differentiated.
 `IMU_BAUD` is a direct wire between two ESP32s with no USB bridge in the
 path, which is why it stays high while the USB link does not.
 
+## Control architecture
+
+Two loops, both on the ESP32, cascaded. Rates come from `CTRL_HZ` and
+`OUTER_DIV`.
+
+```
+  wheel speed, travel ──▶ OUTER (40 Hz, PI) ──▶ lean setpoint
+                                                    │
+                        tilt angle, gyro ──▶ INNER (200 Hz, PID) ──▶ volts
+```
+
+| Define | Value | Meaning |
+|---|---|---|
+| `OUTER_DIV` | 5 | outer loop at `CTRL_HZ / OUTER_DIV` = 40 Hz |
+| `VEL_LPF_HZ` | 2.0 | wheel-speed filter feeding the outer loop |
+| `FOC_VEL_TF` | 0.005 | SimpleFOC's own velocity filter, pinned not defaulted |
+| `KV_DEFAULT` | 0.010 | rad of lean per rad/s of wheel speed |
+| `KVI_DEFAULT` | 0.0026 | rad of lean per rad of wheel travel |
+| `REF_LIMIT_DEFAULT` | 0.052 | 3°, the outer loop's entire authority |
+| `KYAW_P_DEFAULT` | 0.0 | heading hold, off |
+| `KYAW_D_DEFAULT` | 0.05 | heading damping, on |
+| `U_FRIC_DEFAULT` | 0.0 | Coulomb feedforward, off |
+
+**Why the outer loop is not optional.** The balance PID regulates one state.
+Wheel position and speed never enter it, so they are not controlled at all: a
+robot standing perfectly upright while crossing the room is, to that loop, a
+correct answer. Any trim error, floor slope or mass asymmetry then integrates
+without limit. Simulated with a 0.4° trim error, the inner loop alone drifts
+37 m in 30 s and is still accelerating; adding `Kv` bounds it to under a metre
+and `Kvi` brings it back to 0.12 m, with identical peak tilt.
+
+**Why the rate ratio matters more than the rate.** An outer loop close in
+bandwidth to the inner one turns a cascade into two controllers arguing, and
+the result is a slow, large oscillation across the room. Roughly 5:1 is the
+usual practice and is what `OUTER_DIV` encodes.
+
+**Why the lean limit is the safety story.** Whatever the gains do, the outer
+loop cannot ask for more tilt than `REF_LIMIT_DEFAULT`. Raise it only when the
+log says the clamp is active a large fraction of the time; a bigger clamp is
+more authority, not more margin.
+
+**Why the signs come out positive.** Forward wheel state is built from the
+same `MOTORn_DIR` constants used to drive the motors, and `initFOC()` aligns
+each encoder so a positive q-axis voltage gives a positive `shaft_velocity`.
+So `+u` means `+forward` by construction, and holding a positive lean
+decelerates positive travel. `s02_balance.m` still measures the sign from the
+log and says so, because a wrong sign here is a 300 m runaway in simulation.
+
+**Yaw needs no extra sensor.** Differential wheel travel is a heading proxy.
+Damping it removes the slow left-right wander; holding it is a preference and
+defaults off.
+
 ## Wireless link (WiFi access point)
 
 `PC_LINK_WIFI 1` in `config.h` moves the MATLAB link off USB. The motor node
@@ -128,9 +185,15 @@ Four things this arrangement needs, all of them already set:
   batches small writes, and every frame here is a small write.
 - **`WiFi.setSleep(false)`.** ESP32 power saving parks the radio between
   beacons and adds 100 ms or more of latency.
-- **Telemetry is dropped, never blocked.** `pcWrite` checks
-  `availableForWrite` first and skips the frame if the socket is full. A
-  blocking write inside the FOC loop would stall commutation.
+- **Telemetry is dropped, never blocked.** `pcWrite` asks the socket with a
+  zero-timeout `select()` and skips the frame if it is not writable. A
+  blocking write inside the FOC loop would stall commutation:
+  `NetworkClient::write()` gives up only after 10 retries of a 1 s select.
+
+  Do **not** gate this on `availableForWrite()`. `WiFiClient` does not
+  override it, so it returns `Print`'s default of `0` and every frame is
+  silently discarded — the link connects, MATLAB waits, and not one byte
+  arrives. It works on USB only because `HardwareSerial` does override it.
 
 Watch `foc_hz` after switching. The radio stack shares the CPU, and the
 number to compare against is what the same board reported over USB.

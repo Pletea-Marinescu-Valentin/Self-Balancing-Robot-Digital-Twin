@@ -2,7 +2,7 @@
 
 clear; clc; close all;
 
-PORT     = "COM4";      % or "192.168.4.1" for WiFi
+PORT     = "192.168.4.1";      % or "COM4" for USB
 U_TEST   = 3.0;
 TILT_MAX = 3.0;
 HOLD     = 1.2;

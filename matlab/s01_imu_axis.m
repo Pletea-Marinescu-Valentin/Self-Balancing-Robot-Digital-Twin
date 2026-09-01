@@ -3,7 +3,7 @@
 
 clear; clc; close all;
 
-PORT     = "COM4";      % or "192.168.4.1" for WiFi
+PORT     = "192.168.4.1";      % or "COM4" for USB
 TILT_SEC = 4;
 
 lnk = SbrLink(PORT);

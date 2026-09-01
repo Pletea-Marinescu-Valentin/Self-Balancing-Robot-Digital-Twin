@@ -6,17 +6,17 @@ function test_protocol()
 
 fprintf('=== Telemetry frame (motor node -> MATLAB) ===\n');
 
-PKT = 88;
-vals   = (1:20) * 1.5;          % distinct value per float field
+PKT = 100;
+vals   = (1:23) * 1.5;          % distinct value per float field
 t_us   = uint32(123456789);
 status = uint8(1 + 2 + 16 + 32 + bitshift(2, 6));  % armed, imu_ok, imu_fault, imu_link, mode 2
 
 p = zeros(PKT, 1, 'uint8');
 p(1) = 165;  p(2) = 90;                                  % 0xA5 0x5A
 p(3:6)  = typecast(t_us, 'uint8')';
-p(7:86) = typecast(single(vals), 'uint8')';
-p(87)   = status;
-p(88)   = SbrLink.xorSum(p(3:87));      % XOR over bytes 2..86, as in firmware
+p(7:98) = typecast(single(vals), 'uint8')';
+p(99)   = status;
+p(100)  = SbrLink.xorSum(p(3:99));      % XOR over bytes 2..98, as in firmware
 
 % --- size and checksum ---------------------------------------------------
 assert(numel(p) == PKT, 'frame length');
@@ -46,6 +46,9 @@ chk('u1',         d.u1,         vals(17));
 chk('foc_hz',     d.foc_hz,     vals(18));
 chk('imu_hz',     d.imu_hz,     vals(19));
 chk('imu_age_ms', d.imu_age_ms, vals(20));
+chk('ref',        d.ref,        vals(21));
+chk('vel_fwd',    d.vel_fwd,    vals(22));
+chk('pos_fwd',    d.pos_fwd,    vals(23));
 
 % --- status bits ---------------------------------------------------------
 assert(d.armed      == true,  'armed bit');
@@ -60,7 +63,7 @@ assert(d.mode       == 2,     'mode field');
 d2 = SbrLink.decode(p');
 assert(isequal(d, d2), 'decode must accept a row vector too');
 
-fprintf('  20 float fields, 6 status bits, 2 orientations : OK\n');
+fprintf('  23 float fields, 6 status bits, 2 orientations : OK\n');
 
 %% ------------------------------------------------------------------------
 fprintf('\n=== Command frame (MATLAB -> motor node) ===\n');
@@ -76,6 +79,17 @@ assert(numel(cmd) == 16, 'command length');
 q = double(typecast(cmd(4:15), 'single'));
 assert(isequal(q, [3 -1 0]), 'command payload round trip');
 fprintf('  16-byte layout, signed channel selectors      : OK\n');
+
+% The outer-loop gains are the one payload that legitimately carries negative
+% values in normal use, so round-trip a negative one explicitly.
+cmd2 = zeros(1, 16, 'uint8');
+cmd2(1) = 165; cmd2(2) = 90; cmd2(3) = 9;                % SBR_OUTER
+cmd2(4:15) = typecast(single([-0.012 0.0026 0.052]), 'uint8');
+cmd2(16) = SbrLink.xorSum(cmd2(3:15));
+q2 = double(typecast(cmd2(4:15), 'single'));
+assert(abs(q2(1) + 0.012) < 1e-6, 'negative outer gain round trip');
+assert(abs(q2(3) - 0.052) < 1e-6, 'lean limit round trip');
+fprintf('  SBR_OUTER payload, negative gains           : OK\n');
 
 %% ------------------------------------------------------------------------
 fprintf('\n=== IMU link frame (sensor node -> motor node) ===\n');

@@ -55,7 +55,7 @@ convention of pitch, and a silent change there would invert the balance axis.
 
 ---
 
-## Link B · motor node → MATLAB · 88 bytes · `CTRL_HZ / TELEM_DIV` (50 Hz) · 115200 baud
+## Link B · motor node → MATLAB · 100 bytes · `CTRL_HZ / TELEM_DIV` (50 Hz) · 115200 baud
 
 | Offset | Type      | Field        | Unit  | Notes |
 |-------:|-----------|--------------|-------|-------|
@@ -76,8 +76,11 @@ convention of pitch, and a silent change there would invert the balance axis.
 | 74–77  | `float`   | `foc_hz`     | Hz    | measured FOC loop rate |
 | 78–81  | `float`   | `imu_hz`     | Hz    | measured IMU link rate |
 | 82–85  | `float`   | `imu_age_ms` | ms    | time since the last IMU frame |
-| 86     | `uint8`   | `status`     | —     | see below |
-| 87     | `uint8`   | `crc`        | —     | XOR over bytes 2…86 |
+| 86–89  | `float`   | `ref`        | rad   | lean commanded by the outer loop |
+| 90–93  | `float`   | `vel_fwd`    | rad/s | filtered forward wheel speed |
+| 94–97  | `float`   | `pos_fwd`    | rad   | forward travel since the robot caught itself |
+| 98     | `uint8`   | `status`     | —     | see below |
+| 99     | `uint8`   | `crc`        | —     | XOR over bytes 2…98 |
 
 The full sensor vectors are forwarded, not just the selected pair. That is
 what lets `s01_imu_axis.m` identify the balance axis from one tilting motion
@@ -87,6 +90,12 @@ observer without any firmware change.
 `u0`/`u1` are what was **actually applied**, not what was received. The gap
 between what you sent and what appears here is saturation or a safety
 intervention — and it is the channel `s01` uses to measure round-trip latency.
+
+`ref`, `vel_fwd` and `pos_fwd` are the outer loop's own state, on the wire
+because that loop cannot be tuned from the angle trace. A robot can hold a
+flawless balance angle while `pos_fwd` ramps off the table — that combination
+is the entire reason the outer loop exists, and it is invisible unless the
+wheel states are transmitted next to the angle.
 
 `foc_hz` and `imu_hz` are measured, not assumed. They are the cheapest health
 indicators in the system: a collapsing `foc_hz` means the I²C encoder reads are
@@ -134,6 +143,9 @@ node's power. Without the distinction you cannot tell which cable to touch.
 | `0x06` | ARM        | 1 arm (clears latches) / 0 disarm | — | — |
 | `0x07` | TRIM       | equilibrium offset [rad] | — | — |
 | `0x08` | IMU_AXIS   | angle selector | rate selector | — |
+| `0x09` | OUTER      | `Kv` [rad/(rad/s)] | `Kvi` [rad/rad] | lean limit [rad] |
+| `0x0A` | YAW        | heading `Kp` | heading `Kd` | — |
+| `0x0B` | FRICTION   | feedforward [V] | ramp width [rad/s] | — |
 
 In firmware these identifiers are `SBR_TORQUE`, `SBR_GAINS`, … — not `CMD_*`.
 SimpleFOC's `communication/commands.h` defines `CMD_LIMITS`, `CMD_STATUS` and

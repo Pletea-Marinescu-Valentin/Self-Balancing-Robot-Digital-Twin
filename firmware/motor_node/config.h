@@ -40,6 +40,9 @@
 #define MOTOR0_DIR      (+1.0f)
 #define MOTOR1_DIR      (-1.0f)
 
+// Measured on this build, not a guess: held upright, pitch (index 2) read a
+// constant 0.0000 rad while roll tracked the tilt. s01_imu_axis.m re-measures
+// both and pushes them at runtime, so these are only the power-on defaults.
 #define IMU_ANGLE_IDX    2
 #define IMU_ANGLE_SIGN (+1.0f)
 #define IMU_GYRO_IDX     0
@@ -62,5 +65,41 @@
 #endif
 #define TILT_LIMIT_RAD   0.60f
 #define U_LIMIT_DEFAULT   3.0f
+
+// ---------------------------------------------------------------------------
+// Outer loop - wheel speed and travel
+//
+// The balance PID alone regulates one state, the tilt angle. Wheel speed and
+// wheel travel never enter it, so they are not controlled at all: a robot
+// standing perfectly upright while crossing the room is, to that loop, a
+// perfect solution. The result is the "balances fine, drives off the table"
+// behaviour. The fix is a second, slower loop that feeds the balance loop a
+// lean to aim at, because leaning back is the only way a wheeled inverted
+// pendulum can slow down.
+//
+// Rate ratio follows the usual cascade practice of roughly 5:1 - the outer
+// loop must be far slower than the inner one or the two fight each other.
+#define OUTER_DIV         5              // outer loop at CTRL_HZ / OUTER_DIV
+#define VEL_LPF_HZ        2.0f           // wheel-speed filter for the outer loop
+#define FOC_VEL_TF        0.005f         // SimpleFOC's own velocity filter [s]
+
+// Gains are in radians of lean per unit of wheel state. Signs are positive by
+// construction: forward wheel state is built with the same MOTORn_DIR used to
+// drive, and initFOC() aligns each encoder so +u gives +shaft_velocity.
+#define KV_DEFAULT        0.010f         // rad of lean per (rad/s) of wheel speed
+#define KVI_DEFAULT       0.0026f        // rad of lean per rad of wheel travel
+#define REF_LIMIT_DEFAULT 0.052f         // 3 deg. The outer loop's whole authority.
+
+// Yaw hold, from the wheel encoders alone - no extra sensor. Differential
+// wheel travel is a heading proxy, and damping it stops the slow left-right
+// wander. Kp defaults off: damping is safe, holding a heading is a preference.
+#define KYAW_P_DEFAULT    0.0f
+#define KYAW_D_DEFAULT    0.05f
+
+// Coulomb friction feedforward. Gimbal motors in torque mode have real
+// stiction near zero command, which shows up as hunting around the setpoint.
+// Off by default - it is a fix for a specific symptom, not a freebie.
+#define U_FRIC_DEFAULT    0.0f
+#define V_FRIC_EPS        0.5f           // rad/s ramp width, avoids chattering
 
 #define SERIAL_BAUD      115200

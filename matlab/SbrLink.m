@@ -5,6 +5,7 @@ classdef SbrLink < handle
 %   lnk = SbrLink("COM4");            % USB
 %   lnk = SbrLink("192.168.4.1");     % the robot's own access point
 %   lnk.arm(true);  lnk.mode(1);
+%   lnk.outer(kv, kvi, refLimit);     % wheel loop, see s02_balance
 %   d = lnk.readLatest();
 %   lnk.torque(0.5, 0.5);
 %   lnk.stop();  clear lnk
@@ -12,11 +13,11 @@ classdef SbrLink < handle
 %   readLatest() returns the NEWEST valid frame and discards the backlog.
 
     properties (Constant, Access = private)
-        PKT_LEN = 88
+        PKT_LEN = 100
         CMD_LEN = 16
         SYNC0   = uint8(165)
         SYNC1   = uint8(90)
-        MAXBUF  = 88 * 12
+        MAXBUF  = 100 * 12
     end
 
     properties (SetAccess = private)
@@ -175,6 +176,29 @@ classdef SbrLink < handle
         function arm(obj, on),             obj.send(6, double(on), 0, 0); end
         function trim(obj, t),             obj.send(7, t, 0, 0);          end
 
+        function outer(obj, kv, kvi, refLimit)
+        %OUTER  Wheel loop: speed gain, travel gain, lean authority.
+        %   kv       [rad of lean per (rad/s) of wheel speed]  - stops the run
+        %   kvi      [rad of lean per rad of wheel travel]     - returns it
+        %   refLimit [rad] hard clamp on the commanded lean. This is the whole
+        %            safety story of the outer loop: whatever the gains do, it
+        %            can never ask for more tilt than this.
+        %   Both gains may be negative; they should not need to be.
+            obj.send(9, kv, kvi, refLimit);
+        end
+
+        function yaw(obj, kp, kd)
+        %YAW  Heading hold from the wheel encoders. kp holds a heading, kd only
+        %   damps the wander. Damping alone is the safe half.
+            obj.send(10, kp, kd, 0);
+        end
+
+        function friction(obj, uFric, vEps)
+        %FRICTION  Coulomb feedforward [V] and its ramp width [rad/s].
+        %   For stiction hunting around the setpoint. Zero disables it.
+            obj.send(11, uFric, vEps, 0);
+        end
+
         function imuAxis(obj, angIdx, gyrIdx, angSign, gyrSign)
         %IMUAXIS  Select the balance channel at runtime.
         %   angIdx / gyrIdx : 0..2  (Euler: 0 heading, 1 roll, 2 pitch;
@@ -228,8 +252,8 @@ classdef SbrLink < handle
 
         function d = decode(p)
             p  = p(:);
-            f  = double(typecast(p(7:86), "single"));
-            st = p(87);
+            f  = double(typecast(p(7:98), "single"));
+            st = p(99);
             d = struct( ...
                 't_us',       double(typecast(p(3:6), "uint32")), ...
                 'eul',        f(1:3)',   ...
@@ -243,6 +267,9 @@ classdef SbrLink < handle
                 'foc_hz',     f(18), ...
                 'imu_hz',     f(19), ...
                 'imu_age_ms', f(20), ...
+                'ref',        f(21), ...
+                'vel_fwd',    f(22), ...
+                'pos_fwd',    f(23), ...
                 'armed',      bitand(st, 1)  > 0, ...
                 'imu_ok',     bitand(st, 2)  > 0, ...
                 'tilt_fault', bitand(st, 4)  > 0, ...

@@ -3,9 +3,10 @@
 Two-wheel self-balancing robot on brushless gimbal motors, with the control
 loop on an ESP32 and MATLAB as the tuning console and data recorder.
 
-The PID runs on the robot at a fixed 200 Hz. MATLAB never sits inside the
-control loop — it changes gains live, logs, and plots. If the USB link drops,
-the robot keeps balancing.
+Two cascaded loops run on the robot: a balance PID on the tilt angle at
+200 Hz, and a slower wheel loop at 40 Hz that decides what tilt the balance
+loop should aim for. MATLAB never sits inside either — it changes gains live,
+logs, and plots. If the link drops, the robot keeps balancing.
 
 ## Hardware
 
@@ -23,9 +24,9 @@ attitude over UART2. The two boards must share a ground.
 ## Layout
 
 ```
-firmware/motor_node/    FOC, encoders, PID, safety, MATLAB protocol
+firmware/motor_node/    FOC, encoders, cascaded control, safety, protocol
 firmware/imu_node/      BNO055 sampling and streaming
-matlab/                 bring-up, calibration and tuning scripts
+matlab/                 bring-up, calibration, tuning and auto-tuning
 docs/                   protocol and hardware reference
 logs/                   .mat files written by the scripts
 ```
@@ -86,16 +87,86 @@ comes within the capture window and disarms when it leaves, so you start from
 the floor, lift the robot, and it catches itself. Drop it and lift it again —
 the session, the sliders and the log all survive.
 
-Four sliders: `Kp`, `Ki`, `Kd`, and `Trim`. Trim moves the balance point,
-which is what to reach for when the robot creeps steadily in one direction.
+Sliders come in two groups, matching the two loops.
 
-Tuning order:
+**Balance, inner, 200 Hz:** `Kp`, `Ki`, `Kd`, `Trim`. Trim moves the balance
+point, which is what to reach for when the robot creeps steadily one way.
+
+**Wheels, outer, 40 Hz:** `Kv`, `Kvi`, `Lean`, plus `YawD` and `Ufric`. `Kv`
+damps wheel speed, `Kvi` brings the robot back to where it caught itself, and
+`Lean` caps how far the outer loop may ask it to tilt — the outer loop's whole
+authority, and the reason a bad gain there is survivable.
+
+Tune the inner loop first, with `Kv` and `Kvi` at zero. A wheel loop wrapped
+around a badly damped balance loop tells you nothing.
 
 1. `Ki = 0`, `Kd = 0`. Raise `Kp` until it reacts briskly and starts to
    oscillate quickly. Note that value.
 2. Drop `Kp` to about 60% of it, raise `Kd` until the oscillation goes.
-3. Nudge `Trim` until it stops creeping.
+3. Nudge `Trim` until the wheel-travel trace stops ramping one way.
 4. Add `Ki` (0.5–2) last, only to remove a steady lean.
+
+Then the outer loop, which is what keeps it on the table.
+
+5. Raise `Kv` until the robot stops accelerating away and settles to a slow
+   shuffle. Watch the wheel **speed** trace, not the angle.
+6. Add `Kvi` until the travel trace returns towards zero instead of just
+   holding still wherever it stopped.
+7. Raise `Lean` only if the run report says the clamp is active a lot.
+8. `YawD` if it wanders left-right; `Ufric` only if it hunts in place at an
+   otherwise good tune, which is stiction rather than gains.
+
+The report at the end also measures whether `Kv` has the right sign and says
+so, rather than leaving you to discover it by watching the robot leave.
+
+### 4. `s03_autotune.m` — let an agent finish the tune
+
+Hand tuning gets you to "it stands". Getting from there to "it stands still"
+means trading six numbers off against each other, which is a search problem
+rather than an intuition problem.
+
+```matlab
+s03_autotune            % tune the robot
+s03_autotune(true)      % rehearse against a model, no robot involved
+```
+
+Put your hand-found gains in `SEED` at the top first. The agent searches a
+trust region around them, so a good seed is worth more than a big budget.
+
+**It optimises for smoothness, not for small numbers.** Six measurements per
+episode: peak-to-peak tilt, gyro rate, tilt energy above 0.8 Hz, command
+chatter, wheel speed, wheel travel. The middle two are what separate "quiet"
+from "visibly oscillating" — an RMS-only score is happy with a limit cycle.
+
+**It does not need you standing over it.** Gains change live, the way the s02
+sliders do, and the robot stays armed between episodes. Every episode is
+watched on a rolling two-second window: the moment the wobble or the wheel
+speed passes what your own baseline licensed, the episode is cut short, the
+last known-good gains go back on immediately, and that candidate is scored by
+how quickly it went wrong. The robot never gets the chance to build up an
+oscillation or run off the bench. In rehearsal that is typically two cut-short
+episodes and one fall in thirty-odd runs.
+
+**`Ufric` is in the search.** A limit cycle around the setpoint is the classic
+signature of Coulomb friction in the drive rather than of bad gains, and a
+torque-mode gimbal motor has plenty of it. It is searched rather than simply
+switched on, because over-compensated stiction makes a robot jitterier than
+none at all.
+
+Search is a trust region that widens when a stage improves and narrows when it
+does not — the standard safe-BO construction, and what stops the agent from
+throwing the robot across the room to find out what happens.
+
+It finishes with a play-off: the agent's gains and yours, three runs each,
+back to back, reported metric by metric. A noisy objective produces lucky
+episodes, and repetition is the only defence.
+
+**Why not reinforcement learning.** An RL agent learns a policy from scratch
+and needs thousands of episodes; here every episode risks someone picking the
+robot up. The controller is not unknown — it is a cascade whose structure is
+right and whose numbers are wrong. That is black-box optimisation against a
+noisy objective, which is what Bayesian optimisation is for, and what the
+robotics literature uses to tune controllers on hardware.
 
 ### `test_protocol.m`
 
@@ -149,6 +220,18 @@ reads `OPR_MODE` back after configuring it and re-checks it at 10 Hz.
 budget. Higher rates bought nothing and added a variable to every debugging
 session. The stream is binary: opening a serial monitor on it shows
 gibberish at any baud, and that gibberish means the board is transmitting.
+
+**A balance loop alone cannot keep the robot in one place.** It regulates the
+tilt angle and nothing else, so wheel position and speed are uncontrolled
+states: upright and travelling is, to that loop, a perfect answer. No `Kp`,
+`Ki` or `Kd` fixes it — the missing feedback has to be added, not tuned. That
+is what the wheel loop is.
+
+**Never gate a WiFi write on `availableForWrite()`.** `WiFiClient` does not
+override it, so it returns `Print`'s default of `0` and every frame is
+dropped in silence. The link connects, the board looks dead, and nothing in
+the error message points at the sender. `HardwareSerial` does override it,
+which is why the same code worked on USB.
 
 **Pace any MATLAB loop that writes to the port.** An unpaced loop issues
 thousands of commands a second, floods the link and starves its own reads —
